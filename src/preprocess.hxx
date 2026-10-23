@@ -5,6 +5,7 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#include "engine.hxx"
 #include <cstdint>
 #include <memory>
 
@@ -25,5 +26,7 @@ struct Preprocessor {
 };
 
 void initPreprocess(Preprocessor &p, int srcW, int srcH, int srcPixFmt);
-std::unique_ptr<float[]> preprocess(Preprocessor &p, AVFrame *src, float *dst);
+// Writes one letterboxed 640x640 RGB frame into dst in the layout the model
+// input takes (see InputType).
+void preprocess(Preprocessor &p, AVFrame *src, void *dst, InputType type);
 void destroyPreprocess(Preprocessor &p);

@@ -4,10 +4,12 @@
 #include "logger.hxx"
 #include "postprocess.hxx"
 #include "preprocess.hxx"
+#include "profiling.hxx"
 #include "server.hxx"
 #include "streams.hxx"
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cxxopts.hpp>
 #include <functional>
 #include <iostream>
@@ -22,10 +24,11 @@
 struct AppConfig {
   bool build = false;
   bool help = false;
-  std::string model_path = "input/models/yolo11s_dynamic_simplify_nms.onnx";
-  std::string engine_path = "output/yolo11s_dynamic_simplify_nms.engine";
+  std::string model_path = "input/models/yolo11s_dynamic_simplify_batchnms.onnx";
+  std::string engine_path = "output/yolo11s_dynamic_simplify_batchnms.engine";
   std::vector<std::string> input_urls;
   std::string output_url = "rtsp://localhost:8554/argus";
+  Device device = Device::Auto;
   int decoder_threads_count = 1;
   int preprocessor_threads_count = 1;
   int postprocessor_threads_count = 1;
@@ -37,6 +40,7 @@ struct AppConfig {
 struct OutputState {
   Encoder encoder;
   Server server;
+  AVBufferRef *cuda_device = nullptr;
   bool output_opened = false;
   bool output_failed = false;
   int64_t next_frame_id = 0;
@@ -53,15 +57,19 @@ struct DecodeState {
 };
 
 bool parse_args(int argc, char **argv, AppConfig &config) {
-  cxxopts::Options options("argus", "TensorRT YOLO live video pipeline");
-  options.add_options()("build", "Build the TensorRT engine file and exit")(
+  std::string device_name_arg = device_name(config.device);
+  cxxopts::Options options("argus", "YOLO live video pipeline");
+  options.add_options()("build", "Build the engine file and exit")(
+      "device", "Inference device: auto, cuda, rocm, openvino",
+      cxxopts::value<std::string>(device_name_arg)
+          ->default_value(device_name_arg))(
       "model", "ONNX model path",
       cxxopts::value<std::string>(config.model_path)
           ->default_value(config.model_path))(
       "batch", "Maximum batch size supported by the engine",
       cxxopts::value<int>(config.max_batch_size)
           ->default_value(std::to_string(config.max_batch_size)))(
-      "engine", "TensorRT engine path",
+      "engine", "Engine file path (built for the selected device)",
       cxxopts::value<std::string>(config.engine_path)
           ->default_value(config.engine_path))(
       "input", "Input stream URL",
@@ -78,6 +86,12 @@ bool parse_args(int argc, char **argv, AppConfig &config) {
     if (config.help) {
       std::cout << options.help() << std::endl;
       return true;
+    }
+
+    if (!parse_device(device_name_arg, config.device)) {
+      std::cerr << "argument error: unknown --device " << device_name_arg
+                << std::endl;
+      return false;
     }
 
   } catch (const cxxopts::exceptions::exception &err) {
@@ -131,6 +145,7 @@ bool decode_one_frame(const AppConfig &config, DecodeState &state,
     log_msg(LOG_INFO, "decoder",
             "stream " + std::to_string(stream_index) + " input: " + input_url);
 
+    ProfileRange range(Stage::Decode, "open stream");
     if (!openStream(state.decoder, input_url.c_str())) {
       pipeline_ok = false;
       closeStream(state.decoder);
@@ -141,27 +156,33 @@ bool decode_one_frame(const AppConfig &config, DecodeState &state,
     state.opened = true;
   }
 
-  if (!nextFrame(state.decoder)) {
-    closeStream(state.decoder);
-    state.opened = false;
-    log_msg(LOG_INFO, "decoder",
-            "stream " + std::to_string(stream_index) +
-                " decoded frames=" + std::to_string(state.frame_count));
-    return false;
-  }
+  int64_t frame_id = state.frame_count;
+  AVFrame *frame = nullptr;
+  {
+    ProfileRange range(Stage::Decode, stream_index, frame_id);
+    if (!nextFrame(state.decoder)) {
+      closeStream(state.decoder);
+      state.opened = false;
+      log_msg(LOG_INFO, "decoder",
+              "stream " + std::to_string(stream_index) +
+                  " decoded frames=" + std::to_string(state.frame_count));
+      return false;
+    }
 
-  int64_t frame_id = state.frame_count++;
-  if (state.frame_count == 1)
-    log_msg(LOG_INFO, "decoder",
-            "stream " + std::to_string(stream_index) + " first frame decoded");
+    state.frame_count++;
+    if (state.frame_count == 1)
+      log_msg(LOG_INFO, "decoder",
+              "stream " + std::to_string(stream_index) +
+                  " first frame decoded");
 
-  AVFrame *frame = av_frame_clone(state.decoder.frame);
-  if (!frame) {
-    log_msg(LOG_ERROR, "decoder", "could not clone decoded frame");
-    pipeline_ok = false;
-    closeStream(state.decoder);
-    state.opened = false;
-    return false;
+    frame = av_frame_clone(state.decoder.frame);
+    if (!frame) {
+      log_msg(LOG_ERROR, "decoder", "could not clone decoded frame");
+      pipeline_ok = false;
+      closeStream(state.decoder);
+      state.opened = false;
+      return false;
+    }
   }
 
   if (!decoder_queue.push(
@@ -177,7 +198,8 @@ void run_decode(const AppConfig &config, ThreadQueue<int> &decode_work_queue,
                 std::vector<std::unique_ptr<DecodeState>> &decode_states,
                 ThreadQueue<StreamFrame> &decoder_queue,
                 std::atomic<int> &active_decode_streams,
-                std::atomic<bool> &pipeline_ok) {
+                std::atomic<bool> &pipeline_ok, int thread_index) {
+  profile_thread_name(Stage::Decode, thread_index);
   int stream_index = -1;
   while (decode_work_queue.pop(stream_index)) {
     if (stream_index < 0 || stream_index >= (int)decode_states.size()) {
@@ -199,30 +221,36 @@ void run_decode(const AppConfig &config, ThreadQueue<int> &decode_work_queue,
   }
 }
 
-void run_preprocess(ThreadQueue<StreamFrame> &decoder_queue,
-                    ThreadQueue<StreamFrame> &preprocessor_queue) {
+void run_preprocess(Engine &engine, ThreadQueue<StreamFrame> &decoder_queue,
+                    ThreadQueue<StreamFrame> &preprocessor_queue,
+                    int thread_index) {
+  profile_thread_name(Stage::Preprocess, thread_index);
   Preprocessor pre;
   bool pre_ready = false;
   int src_w = 0;
   int src_h = 0;
   int src_pix_fmt = -1;
-  std::unique_ptr<float[]> cpu_input{new float[3 * 640 * 640]};
   StreamFrame item;
   while (decoder_queue.pop(item)) {
-    if (!pre_ready || src_w != item.frame->width ||
-        src_h != item.frame->height || src_pix_fmt != item.frame->format) {
-      if (pre_ready)
-        destroyPreprocess(pre);
+    {
+      ProfileRange range(Stage::Preprocess, item.stream_index, item.frame_id);
+      if (!pre_ready || src_w != item.frame->width ||
+          src_h != item.frame->height || src_pix_fmt != item.frame->format) {
+        if (pre_ready)
+          destroyPreprocess(pre);
 
-      src_w = item.frame->width;
-      src_h = item.frame->height;
-      src_pix_fmt = item.frame->format;
-      initPreprocess(pre, src_w, src_h, src_pix_fmt);
-      pre_ready = true;
+        src_w = item.frame->width;
+        src_h = item.frame->height;
+        src_pix_fmt = item.frame->format;
+        initPreprocess(pre, src_w, src_h, src_pix_fmt);
+        pre_ready = true;
+      }
+
+      item.frame_rgb = engine.acquire_input_frame();
+      if (item.frame_rgb)
+        preprocess(pre, item.frame, item.frame_rgb.get(), engine.inputType);
+      item.letterbox = pre.letterbox;
     }
-
-    item.frame_rgb = preprocess(pre, item.frame, cpu_input.get());
-    item.letterbox = pre.letterbox;
     preprocessor_queue.push(std::move(item));
   }
 
@@ -231,87 +259,106 @@ void run_preprocess(ThreadQueue<StreamFrame> &decoder_queue,
 }
 
 void run_infer(Engine &engine, ThreadQueue<StreamFrame> &preprocessor_queue,
-               ThreadQueue<StreamFrame> &inference_queue, int batch_capacity) {
+               ThreadQueue<StreamFrame> &inference_queue, int batch_capacity,
+               int slot) {
+  profile_thread_name(Stage::Infer, slot);
   std::unique_ptr<float[]> cpu_output{
-      new float[engine.outputBytes / sizeof(float)]};
+      new float[batch_capacity * engine.outputElementsPerFrame]};
 
   std::vector<StreamFrame> stream_batch;
-  const int single_cpu_input = 3 * 640 * 640;
-
-  std::vector<float> cpu_input;
-  cpu_input.resize(batch_capacity * single_cpu_input);
+  std::vector<const void *> cpu_inputs;
   stream_batch.reserve(batch_capacity);
+  cpu_inputs.reserve(batch_capacity);
 
   int64_t batch_count = 0;
   int last_logged_batch_size = -1;
   log_msg(LOG_INFO, "infer",
-          "shared inference thread started max_batch=" +
-              std::to_string(batch_capacity));
+          "inference thread " + std::to_string(slot) +
+              " started max_batch=" + std::to_string(batch_capacity));
 
   StreamFrame item;
   while (preprocessor_queue.pop(item)) {
     stream_batch.clear();
+    cpu_inputs.clear();
 
-    int batch_index = (int)stream_batch.size();
-    std::copy(item.frame_rgb.get(), item.frame_rgb.get() + single_cpu_input,
-              cpu_input.data() + batch_index * single_cpu_input);
-    stream_batch.push_back(std::move(item));
+    {
+      // Collects frame pointers only; the frames are already in the engine's
+      // input memory. try_pop never blocks.
+      ProfileRange range(Stage::Infer, "gather batch");
+      cpu_inputs.push_back(item.frame_rgb.get());
+      stream_batch.push_back(std::move(item));
 
-    while ((int)stream_batch.size() < batch_capacity) {
-      StreamFrame next_item;
-      if (!preprocessor_queue.try_pop(next_item))
-        break;
+      while ((int)stream_batch.size() < batch_capacity) {
+        StreamFrame next_item;
+        if (!preprocessor_queue.try_pop(next_item))
+          break;
 
-      batch_index = (int)stream_batch.size();
-      std::copy(next_item.frame_rgb.get(),
-                next_item.frame_rgb.get() + single_cpu_input,
-                cpu_input.data() + batch_index * single_cpu_input);
-      stream_batch.push_back(std::move(next_item));
+        cpu_inputs.push_back(next_item.frame_rgb.get());
+        stream_batch.push_back(std::move(next_item));
+      }
     }
 
     int current_batch_size = (int)stream_batch.size();
     if (current_batch_size != last_logged_batch_size || batch_count % 60 == 0) {
       log_msg(LOG_INFO, "infer",
-              "batch=" + std::to_string(batch_count) +
+              "slot=" + std::to_string(slot) +
+                  " batch=" + std::to_string(batch_count) +
                   " size=" + std::to_string(current_batch_size));
       last_logged_batch_size = current_batch_size;
     }
 
-    std::unique_ptr<float[]> batch_output = run_inference(
-        engine, cpu_input.data(), cpu_output.get(), current_batch_size);
-    if (!batch_output)
-      continue;
+    {
+      char label[32];
+      std::snprintf(label, sizeof(label), "infer batch n=%d",
+                    current_batch_size);
+      ProfileRange range(Stage::Infer, label);
+      if (!engine.infer(slot, cpu_inputs.data(), cpu_output.get(),
+                        current_batch_size))
+        continue;
 
-    for (int i = 0; i < current_batch_size; i++) {
-      stream_batch[i].output.reset(new float[engine.outputElementsPerFrame]);
-      std::copy(batch_output.get() + i * engine.outputElementsPerFrame,
-                batch_output.get() + (i + 1) * engine.outputElementsPerFrame,
-                stream_batch[i].output.get());
-      inference_queue.push(std::move(stream_batch[i]));
+      for (int i = 0; i < current_batch_size; i++) {
+        stream_batch[i].frame_rgb.reset();
+        stream_batch[i].output.reset(new float[engine.outputElementsPerFrame]);
+        std::copy(cpu_output.get() + i * engine.outputElementsPerFrame,
+                  cpu_output.get() + (i + 1) * engine.outputElementsPerFrame,
+                  stream_batch[i].output.get());
+      }
     }
+
+    for (int i = 0; i < current_batch_size; i++)
+      inference_queue.push(std::move(stream_batch[i]));
     batch_count++;
   }
 
-  log_msg(LOG_INFO, "infer", "shared inference thread stopped");
+  log_msg(LOG_INFO, "infer",
+          "inference thread " + std::to_string(slot) + " stopped");
 }
 
 void run_postprocess(ThreadQueue<StreamFrame> &inference_queue,
                      ThreadQueue<StreamFrame> &postprocessor_queue,
-                     int max_dets) {
+                     const OutputLayout &layout, int thread_index) {
+  profile_thread_name(Stage::Postprocess, thread_index);
   StreamFrame item;
   while (inference_queue.pop(item)) {
-    item.detections =
-        postprocess(item.output.get(), max_dets, item.frame->width,
-                    item.frame->height, item.letterbox);
+    {
+      ProfileRange range(Stage::Postprocess, item.stream_index, item.frame_id);
+      item.detections =
+          postprocess(item.output.get(), layout, item.frame->width,
+                      item.frame->height, item.letterbox);
+    }
     postprocessor_queue.push(std::move(item));
   }
 }
 
 void run_draw(ThreadQueue<StreamFrame> &postprocessor_queue,
-              ThreadQueue<StreamFrame> &encoder_queue) {
+              ThreadQueue<StreamFrame> &encoder_queue, int thread_index) {
+  profile_thread_name(Stage::Draw, thread_index);
   StreamFrame item;
   while (postprocessor_queue.pop(item)) {
-    draw_box(item.detections, item.frame);
+    {
+      ProfileRange range(Stage::Draw, item.stream_index, item.frame_id);
+      draw_box(item.detections, item.frame);
+    }
     encoder_queue.push(std::move(item));
   }
 }
@@ -321,11 +368,14 @@ bool encode_output_frame(OutputState &state, const AppConfig &config,
   if (state.output_failed)
     return false;
 
+  ProfileRange range(Stage::Encode, item.stream_index, item.frame_id);
   if (!state.output_opened) {
+    ProfileRange open_range(Stage::Encode, "open output");
     std::string output_url =
         indexed_output_url(config.output_url, item.stream_index);
     if (!open_encoder(state.encoder, item.frame->width, item.frame->height,
-                      (AVPixelFormat)item.frame->format, item.frame_rate)) {
+                      (AVPixelFormat)item.frame->format, item.frame_rate,
+                      state.cuda_device)) {
       state.output_failed = true;
       pipeline_ok = false;
       return false;
@@ -394,7 +444,8 @@ void flush_output_state(OutputState &state, const AppConfig &config,
 void run_encode(const AppConfig &config,
                 ThreadQueue<StreamFrame> &encoder_queue,
                 std::vector<std::unique_ptr<OutputState>> &output_states,
-                std::atomic<bool> &pipeline_ok) {
+                std::atomic<bool> &pipeline_ok, int thread_index) {
+  profile_thread_name(Stage::Encode, thread_index);
   StreamFrame item;
   while (encoder_queue.pop(item)) {
     if (item.stream_index < 0 ||
@@ -421,7 +472,11 @@ void run_encode(const AppConfig &config,
 
 bool run_stream(Engine &engine, const AppConfig &config, int batch_size) {
   int stream_count = (int)config.input_urls.size();
-  int max_dets = (int)(engine.outputElementsPerFrame / 6);
+  OutputLayout layout;
+  if (!output_layout(engine.outputDims, layout)) {
+    log_msg(LOG_ERROR, "main", "unsupported model output shape");
+    return false;
+  }
   std::atomic<int> active_decode_streams{stream_count};
   std::atomic<bool> pipeline_ok{true};
 
@@ -448,8 +503,16 @@ bool run_stream(Engine &engine, const AppConfig &config, int batch_size) {
   decode_states.reserve(stream_count);
   output_states.reserve(stream_count);
 
-  log_msg(LOG_INFO, "main",
-          "max detections from model output: " + std::to_string(max_dets));
+  if (layout.nmsIncluded)
+    log_msg(LOG_INFO, "main",
+            "model output has NMS included, max detections=" +
+                std::to_string(layout.maxDets));
+  else
+    log_msg(LOG_INFO, "main",
+            "model output is the raw head, classes=" +
+                std::to_string(layout.numClasses) +
+                " anchors=" + std::to_string(layout.numAnchors) +
+                "; running NMS on the CPU");
 
   for (int stream_index = 0; stream_index < stream_count; stream_index++) {
     auto state = std::make_unique<DecodeState>();
@@ -462,30 +525,39 @@ bool run_stream(Engine &engine, const AppConfig &config, int batch_size) {
     decoder_threads.emplace_back(
         run_decode, std::ref(config), std::ref(decode_work_queue),
         std::ref(decode_states), std::ref(decoder_queue),
-        std::ref(active_decode_streams), std::ref(pipeline_ok));
+        std::ref(active_decode_streams), std::ref(pipeline_ok), i);
   }
 
   for (int i = 0; i < config.preprocessor_threads_count; i++) {
-    preprocess_threads.emplace_back(run_preprocess, std::ref(decoder_queue),
-                                    std::ref(preprocessor_queue));
+    preprocess_threads.emplace_back(run_preprocess, std::ref(engine),
+                                    std::ref(decoder_queue),
+                                    std::ref(preprocessor_queue), i);
   }
 
-  std::thread infer_thread(run_infer, std::ref(engine),
-                           std::ref(preprocessor_queue),
-                           std::ref(inference_queue), batch_size);
+  // One thread per engine slot, so one batch can upload while another
+  // computes.
+  std::vector<std::thread> infer_threads;
+  for (int slot = 0; slot < engine.slotCount; slot++) {
+    infer_threads.emplace_back(run_infer, std::ref(engine),
+                               std::ref(preprocessor_queue),
+                               std::ref(inference_queue), batch_size, slot);
+  }
 
   for (int i = 0; i < config.postprocessor_threads_count; i++) {
     postprocess_threads.emplace_back(run_postprocess, std::ref(inference_queue),
-                                     std::ref(postprocessor_queue), max_dets);
+                                     std::ref(postprocessor_queue),
+                                     std::cref(layout), i);
   }
 
   for (int i = 0; i < config.drawer_threads_count; i++) {
     draw_threads.emplace_back(run_draw, std::ref(postprocessor_queue),
-                              std::ref(encoder_queue));
+                              std::ref(encoder_queue), i);
   }
 
+  AVBufferRef *cuda_device = open_cuda_device();
   for (int stream_index = 0; stream_index < stream_count; stream_index++) {
     output_states.push_back(std::make_unique<OutputState>());
+    output_states.back()->cuda_device = cuda_device;
 
     std::string output_url =
         indexed_output_url(config.output_url, stream_index);
@@ -497,7 +569,8 @@ bool run_stream(Engine &engine, const AppConfig &config, int batch_size) {
   for (int i = 0; i < config.encoder_threads_count; i++) {
     encode_threads.emplace_back(run_encode, std::ref(config),
                                 std::ref(encoder_queue),
-                                std::ref(output_states), std::ref(pipeline_ok));
+                                std::ref(output_states), std::ref(pipeline_ok),
+                                i);
   }
 
   for (auto &thread : decoder_threads)
@@ -508,7 +581,8 @@ bool run_stream(Engine &engine, const AppConfig &config, int batch_size) {
     thread.join();
   preprocessor_queue.close();
 
-  infer_thread.join();
+  for (auto &thread : infer_threads)
+    thread.join();
   inference_queue.close();
 
   for (auto &thread : postprocess_threads)
@@ -525,6 +599,7 @@ bool run_stream(Engine &engine, const AppConfig &config, int batch_size) {
 
   for (auto &state : output_states)
     flush_output_state(*state, config, pipeline_ok);
+  av_buffer_unref(&cuda_device);
 
   return pipeline_ok;
 }
@@ -539,13 +614,15 @@ int main(int argc, char **argv) {
   log_msg(LOG_INFO, "main", "argus starting");
   log_msg(LOG_INFO, "main", std::string("model: ") + config.model_path);
   log_msg(LOG_INFO, "main", std::string("engine: ") + config.engine_path);
+  log_msg(LOG_INFO, "main",
+          std::string("device: ") + device_name(resolve_device(config.device)));
 
   if (config.build) {
-    log_msg(LOG_INFO, "main", "TensorRT engine build started");
-    bool built =
-        build_engine_file(config.model_path.c_str(), config.engine_path.c_str(),
-                          config.max_batch_size);
-    log_msg(LOG_INFO, "main", "TensorRT engine build finished");
+    log_msg(LOG_INFO, "main", "engine build started");
+    bool built = build_engine_file(config.device, config.model_path.c_str(),
+                                   config.engine_path.c_str(),
+                                   config.max_batch_size);
+    log_msg(LOG_INFO, "main", "engine build finished");
     return built ? 0 : -1;
   }
 
@@ -560,15 +637,25 @@ int main(int argc, char **argv) {
   int reserved_threads = hardware_threads >= 16  ? 4
                          : hardware_threads >= 8 ? 2
                                                  : 1;
-  constexpr int inference_threads_count = 1;
-  int max_threads =
-      hardware_threads - reserved_threads - inference_threads_count;
   int stream_count = input_count;
+  int batch_size = std::min(stream_count, config.max_batch_size);
 
+  std::unique_ptr<Engine> engine =
+      load_engine(config.device, config.engine_path.c_str(), batch_size);
+  if (!engine) {
+    log_msg(LOG_ERROR, "main", "engine is not ready");
+    return -1;
+  }
+  log_msg(LOG_INFO, "main", "engine load finished");
+
+  int max_threads = hardware_threads - reserved_threads - engine->slotCount;
+
+  // Preprocess (resize, color convert, normalize on the CPU) is the busiest
+  // stage. Decode and encode mostly wait on cuvid/NVENC hardware.
   config.decoder_threads_count =
-      std::max(config.decoder_threads_count, max_threads * 4 / 10);
+      std::max(config.decoder_threads_count, max_threads * 2 / 10);
   config.preprocessor_threads_count =
-      std::max(config.preprocessor_threads_count, max_threads * 1 / 10);
+      std::max(config.preprocessor_threads_count, max_threads * 4 / 10);
   config.postprocessor_threads_count =
       std::max(config.postprocessor_threads_count, max_threads * 1 / 10);
   config.drawer_threads_count =
@@ -576,19 +663,6 @@ int main(int argc, char **argv) {
   config.encoder_threads_count =
       std::max(config.encoder_threads_count, max_threads * 3 / 10);
 
-  int batch_size = std::min(stream_count, config.max_batch_size);
-
-  Engine engine;
-  engine = load_engine(config.engine_path.c_str(), batch_size);
-  log_msg(LOG_INFO, "main", "TensorRT engine load finished");
-
-  if (!engine.context || !engine.inputBuffer || !engine.outputBuffer) {
-    log_msg(LOG_ERROR, "main", "TensorRT engine is not ready");
-    destroy_engine(engine);
-    return -1;
-  }
-
-  bool stream_ok = run_stream(engine, config, batch_size);
-  destroy_engine(engine);
+  bool stream_ok = run_stream(*engine, config, batch_size);
   return stream_ok ? 0 : -1;
 }
