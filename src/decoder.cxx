@@ -33,6 +33,35 @@ const char *nvidia_decoder_name(AVCodecID codec_id) {
   }
 }
 
+bool open_codec(Decoder &d, const AVCodec *codec,
+                const AVCodecParameters *codecParams) {
+  avcodec_free_context(&d.codecCtx);
+
+  log_msg(LOG_INFO, "decoder",
+          std::string("allocating decoder context for ") + codec->name);
+  d.codecCtx = avcodec_alloc_context3(codec);
+  if (!d.codecCtx) {
+    log_msg(LOG_ERROR, "decoder", "could not allocate decoder context");
+    return false;
+  }
+
+  int ret = avcodec_parameters_to_context(d.codecCtx, codecParams);
+  if (ret < 0) {
+    log_av_error(LOG_ERROR, "decoder", "could not copy codec parameters", ret);
+    return false;
+  }
+
+  log_msg(LOG_INFO, "decoder", "avcodec_open2 started");
+  ret = avcodec_open2(d.codecCtx, codec, nullptr);
+  log_msg(LOG_INFO, "decoder", "avcodec_open2 finished");
+  if (ret < 0) {
+    log_av_error(LOG_ERROR, "decoder", "could not open decoder", ret);
+    return false;
+  }
+
+  return true;
+}
+
 } // namespace
 
 bool openStream(Decoder &d, const char *url) {
@@ -151,26 +180,17 @@ bool openStream(Decoder &d, const char *url) {
     return false;
   }
 
-  log_msg(LOG_INFO, "decoder",
-          std::string("allocating decoder context for ") + codec->name);
-  d.codecCtx = avcodec_alloc_context3(codec);
-  if (!d.codecCtx) {
-    log_msg(LOG_ERROR, "decoder", "could not allocate decoder context");
-    return false;
-  }
+  if (!open_codec(d, codec, codecParams)) {
+    // CUVID needs a working NVIDIA GPU. On AMD/Intel machines (or a broken
+    // NVIDIA driver) fall back to FFmpeg's software decoder.
+    const AVCodec *software = avcodec_find_decoder(codecParams->codec_id);
+    if (!software || software == codec)
+      return false;
 
-  ret = avcodec_parameters_to_context(d.codecCtx, codecParams);
-  if (ret < 0) {
-    log_av_error(LOG_ERROR, "decoder", "could not copy codec parameters", ret);
-    return false;
-  }
-
-  log_msg(LOG_INFO, "decoder", "avcodec_open2 started");
-  ret = avcodec_open2(d.codecCtx, codec, nullptr);
-  log_msg(LOG_INFO, "decoder", "avcodec_open2 finished");
-  if (ret < 0) {
-    log_av_error(LOG_ERROR, "decoder", "could not open decoder", ret);
-    return false;
+    log_msg(LOG_WARNING, "decoder",
+            std::string("falling back to decoder ") + software->name);
+    if (!open_codec(d, software, codecParams))
+      return false;
   }
 
   log_msg(LOG_INFO, "decoder",

@@ -14,10 +14,13 @@ struct Encoder {
   int64_t next_pts = 0;
 };
 
+AVBufferRef *open_cuda_device();
+
 bool open_encoder(Encoder &e, AVStream *in_stream,
-                  AVCodecContext *decoder_codec_ctx);
+                  AVCodecContext *decoder_codec_ctx,
+                  AVBufferRef *cuda_device = nullptr);
 bool open_encoder(Encoder &e, int width, int height, AVPixelFormat pix_fmt,
-                  AVRational fps);
+                  AVRational fps, AVBufferRef *cuda_device = nullptr);
 bool serve_stream(Encoder &e, Server &s, AVFrame *frame);
 bool flush_encoder(Encoder &e, Server &s);
 void close_encoder(Encoder &e);

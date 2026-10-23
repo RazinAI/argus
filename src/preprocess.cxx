@@ -26,26 +26,27 @@ void initPreprocess(Preprocessor &p, int srcW, int srcH, int srcPixFmt) {
   p.rgbBuf.reset(new uint8_t[p.dstW * p.dstH * 3]);
 }
 
-std::unique_ptr<float[]> preprocess(Preprocessor &p, AVFrame *src, float *dst) {
-  std::fill(p.rgbBuf.get(), p.rgbBuf.get() + p.dstW * p.dstH * 3, 114);
+void preprocess(Preprocessor &p, AVFrame *src, void *dst, InputType type) {
+  // A uint8 model takes swscale's interleaved RGB as is, so write it straight
+  // into dst. A float model needs it scaled and planar, so stage it first.
+  uint8_t *rgb = type == InputType::Uint8 ? static_cast<uint8_t *>(dst)
+                                          : p.rgbBuf.get();
+  std::fill(rgb, rgb + p.dstW * p.dstH * 3, 114);
 
-  uint8_t *dstRGB[1] = {p.rgbBuf.get() +
-                        p.letterbox.pad_y * p.dstW * 3 +
+  uint8_t *dstRGB[1] = {rgb + p.letterbox.pad_y * p.dstW * 3 +
                         p.letterbox.pad_x * 3};
   int dstStride[1] = {p.dstW * 3};
   sws_scale(p.sws, src->data, src->linesize, 0, src->height, dstRGB, dstStride);
+  if (type == InputType::Uint8)
+    return;
 
+  float *out = static_cast<float *>(dst);
   const int nPixels = p.dstW * p.dstH;
-  const uint8_t *rgb = p.rgbBuf.get();
   for (int k = 0; k < nPixels; k++) {
-    dst[k] = rgb[3 * k] / 255.0f;
-    dst[nPixels + k] = rgb[3 * k + 1] / 255.0f;
-    dst[2 * nPixels + k] = rgb[3 * k + 2] / 255.0f;
+    out[k] = rgb[3 * k] / 255.0f;
+    out[nPixels + k] = rgb[3 * k + 1] / 255.0f;
+    out[2 * nPixels + k] = rgb[3 * k + 2] / 255.0f;
   }
-  std::unique_ptr<float[]> frame_rgb{new float[3 * nPixels]};
-  std::copy(dst, dst + 3 * nPixels, frame_rgb.get());
-
-  return frame_rgb;
 }
 
 void destroyPreprocess(Preprocessor &p) {

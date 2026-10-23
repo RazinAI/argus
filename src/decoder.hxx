@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine.hxx"
 #include "postprocess.hxx"
 #include "preprocess.hxx"
 #include "streams.hxx"
@@ -28,7 +29,7 @@ struct StreamFrame {
   int64_t frame_id = 0;
   AVRational frame_rate = {30, 1};
   LetterboxTransform letterbox;
-  std::unique_ptr<float[]> frame_rgb;
+  InputFrame frame_rgb;
   std::unique_ptr<float[]> output;
   std::vector<Detection> detections;
 

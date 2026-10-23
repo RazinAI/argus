@@ -31,25 +31,134 @@ constexpr YuvColor Teal = {120, 149, 84};
 
 } // namespace
 
-std::vector<Detection> postprocess(const float *output, // [1, max_dets, 6]
-                                   int maxDets, int srcW, int srcH,
-                                   const LetterboxTransform &letterbox) {
+namespace {
+
+// Ultralytics predict defaults.
+constexpr float kConfThreshold = 0.25f;
+constexpr float kIouThreshold = 0.7f;
+constexpr int kMaxDetections = 300;
+
+float iou(const Detection &a, const Detection &b) {
+  float w = std::min(a.x2, b.x2) - std::max(a.x1, b.x1);
+  float h = std::min(a.y2, b.y2) - std::max(a.y1, b.y1);
+  if (w <= 0.0f || h <= 0.0f)
+    return 0.0f;
+  float inter = w * h;
+  float area_a = (a.x2 - a.x1) * (a.y2 - a.y1);
+  float area_b = (b.x2 - b.x1) * (b.y2 - b.y1);
+  return inter / (area_a + area_b - inter);
+}
+
+// Boxes come out of the model in 640x640 letterboxed input space. Undo the
+// letterbox padding and scale, then clamp to the source frame.
+Detection to_source(Detection d, int srcW, int srcH,
+                    const LetterboxTransform &letterbox) {
+  d.x1 = std::clamp((d.x1 - letterbox.pad_x) / letterbox.scale, 0.0f,
+                    (float)(srcW - 1));
+  d.y1 = std::clamp((d.y1 - letterbox.pad_y) / letterbox.scale, 0.0f,
+                    (float)(srcH - 1));
+  d.x2 = std::clamp((d.x2 - letterbox.pad_x) / letterbox.scale, 0.0f,
+                    (float)(srcW - 1));
+  d.y2 = std::clamp((d.y2 - letterbox.pad_y) / letterbox.scale, 0.0f,
+                    (float)(srcH - 1));
+  return d;
+}
+
+std::vector<Detection> postprocess_nms(const float *output, int maxDets) {
   std::vector<Detection> dets;
   for (int i = 0; i < maxDets; i++) {
-    float x1 = (output[i * 6] - letterbox.pad_x) / letterbox.scale;
-    float y1 = (output[i * 6 + 1] - letterbox.pad_y) / letterbox.scale;
-    float x2 = (output[i * 6 + 2] - letterbox.pad_x) / letterbox.scale;
-    float y2 = (output[i * 6 + 3] - letterbox.pad_y) / letterbox.scale;
-    float conf = output[i * 6 + 4];
-    int classId = output[i * 6 + 5];
-    if (conf <= 0.0f)
-      break; // Ouput sometimes add padded 0s to the maxDets
-    x1 = std::clamp(x1, 0.0f, (float)(srcW - 1));
-    y1 = std::clamp(y1, 0.0f, (float)(srcH - 1));
-    x2 = std::clamp(x2, 0.0f, (float)(srcW - 1));
-    y2 = std::clamp(y2, 0.0f, (float)(srcH - 1));
-    dets.push_back({x1, y1, x2, y2, conf, classId});
+    const float *row = output + i * 6;
+    if (row[4] <= 0.0f)
+      break; // Output is padded with 0s up to maxDets
+    dets.push_back({row[0], row[1], row[2], row[3], row[4], (int)row[5]});
   }
+  return dets;
+}
+
+std::vector<Detection> postprocess_raw(const float *output, int numClasses,
+                                       int numAnchors) {
+  // Best class per anchor. Walk class rows in order so reads stay sequential.
+  std::vector<float> best_score(numAnchors, 0.0f);
+  std::vector<int> best_class(numAnchors, 0);
+  for (int c = 0; c < numClasses; c++) {
+    const float *scores = output + (std::size_t)(4 + c) * numAnchors;
+    for (int a = 0; a < numAnchors; a++) {
+      if (scores[a] > best_score[a]) {
+        best_score[a] = scores[a];
+        best_class[a] = c;
+      }
+    }
+  }
+
+  std::vector<Detection> candidates;
+  for (int a = 0; a < numAnchors; a++) {
+    if (best_score[a] <= kConfThreshold)
+      continue;
+    float cx = output[a];
+    float cy = output[numAnchors + a];
+    float w = output[2 * numAnchors + a];
+    float h = output[3 * numAnchors + a];
+    candidates.push_back({cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2,
+                          best_score[a], best_class[a]});
+  }
+
+  std::sort(candidates.begin(), candidates.end(),
+            [](const Detection &a, const Detection &b) {
+              return a.conf > b.conf;
+            });
+
+  // Greedy per-class NMS: keep the highest score, drop same-class boxes that
+  // overlap it too much.
+  std::vector<Detection> dets;
+  std::vector<bool> suppressed(candidates.size(), false);
+  for (std::size_t i = 0; i < candidates.size(); i++) {
+    if (suppressed[i])
+      continue;
+    dets.push_back(candidates[i]);
+    if ((int)dets.size() == kMaxDetections)
+      break;
+    for (std::size_t j = i + 1; j < candidates.size(); j++) {
+      if (!suppressed[j] && candidates[j].classId == candidates[i].classId &&
+          iou(candidates[i], candidates[j]) > kIouThreshold)
+        suppressed[j] = true;
+    }
+  }
+  return dets;
+}
+
+} // namespace
+
+bool output_layout(const std::vector<std::size_t> &dims, OutputLayout &layout) {
+  if (dims.size() != 2)
+    return false;
+
+  if (dims[1] == 6) {
+    layout.nmsIncluded = true;
+    layout.maxDets = (int)dims[0];
+    return true;
+  }
+
+  if (dims[0] > 4) {
+    layout.nmsIncluded = false;
+    layout.numClasses = (int)dims[0] - 4;
+    layout.numAnchors = (int)dims[1];
+    return true;
+  }
+
+  return false;
+}
+
+std::vector<Detection> postprocess(const float *output,
+                                   const OutputLayout &layout, int srcW,
+                                   int srcH,
+                                   const LetterboxTransform &letterbox) {
+  std::vector<Detection> dets =
+      layout.nmsIncluded
+          ? postprocess_nms(output, layout.maxDets)
+          : postprocess_raw(output, layout.numClasses, layout.numAnchors);
+
+  for (Detection &d : dets)
+    d = to_source(d, srcW, srcH, letterbox);
   return dets;
 }
 

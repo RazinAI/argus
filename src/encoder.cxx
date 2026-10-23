@@ -1,5 +1,6 @@
 #include "encoder.hxx"
 #include "logger.hxx"
+#include "profiling.hxx"
 #include "server.hxx"
 #include "streams.hxx"
 
@@ -7,7 +8,11 @@
 
 extern "C" {
 #include <libavutil/error.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
+#ifdef ARGUS_WITH_TENSORRT
+#include <libavutil/hwcontext_cuda.h>
+#endif
 }
 
 namespace {
@@ -95,7 +100,7 @@ void set_backend_options(AVDictionary **opts, EncoderBackend backend) {
 
 bool open_encoder_backend(Encoder &e, int width, int height,
                           AVPixelFormat pix_fmt, AVRational fps,
-                          EncoderBackend backend) {
+                          EncoderBackend backend, AVBufferRef *cuda_device) {
   const char *codec_name = backend_codec_name(backend);
   log_msg(LOG_INFO, "encoder",
           std::string("finding H.264 encoder ") + codec_name);
@@ -140,6 +145,14 @@ bool open_encoder_backend(Encoder &e, int width, int height,
   e.codec_ctx->max_b_frames = 0;
   if (backend == EncoderBackend::X264)
     e.codec_ctx->thread_count = 1;
+  if (backend == EncoderBackend::Nvenc && cuda_device) {
+    e.codec_ctx->hw_device_ctx = av_buffer_ref(cuda_device);
+    if (!e.codec_ctx->hw_device_ctx) {
+      log_msg(LOG_ERROR, "encoder", "could not reference the CUDA device");
+      close_encoder(e);
+      return false;
+    }
+  }
 
   log_msg(LOG_INFO, "encoder",
           "config backend=" + std::string(backend_label(backend)) +
@@ -182,8 +195,30 @@ bool open_encoder_backend(Encoder &e, int width, int height,
 
 } // namespace
 
+AVBufferRef *open_cuda_device() {
+  AVBufferRef *device = nullptr;
+  // Share TensorRT's (primary) context: work from separate contexts can't
+  // overlap on the GPU, it takes turns in time slices.
+  int flags = 0;
+#ifdef ARGUS_WITH_TENSORRT
+  flags = AV_CUDA_USE_PRIMARY_CONTEXT;
+#endif
+  int ret = av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_CUDA, nullptr,
+                                   nullptr, flags);
+  if (ret < 0) {
+    log_av_error(LOG_WARNING, "encoder",
+                 "no shared CUDA device; each NVENC encoder makes its own",
+                 ret);
+    return nullptr;
+  }
+
+  log_msg(LOG_INFO, "encoder", "shared CUDA device opened for NVENC");
+  return device;
+}
+
 bool open_encoder(Encoder &e, AVStream *in_stream,
-                  AVCodecContext *decoder_codec_ctx) {
+                  AVCodecContext *decoder_codec_ctx,
+                  AVBufferRef *cuda_device) {
   if (!decoder_codec_ctx) {
     log_msg(LOG_ERROR, "encoder", "decoder codec context is null");
     return false;
@@ -191,19 +226,19 @@ bool open_encoder(Encoder &e, AVStream *in_stream,
 
   return open_encoder(e, decoder_codec_ctx->width, decoder_codec_ctx->height,
                       (AVPixelFormat)decoder_codec_ctx->pix_fmt,
-                      stream_fps(in_stream));
+                      stream_fps(in_stream), cuda_device);
 }
 
 bool open_encoder(Encoder &e, int width, int height, AVPixelFormat pix_fmt,
-                  AVRational fps) {
+                  AVRational fps, AVBufferRef *cuda_device) {
   if (open_encoder_backend(e, width, height, pix_fmt, fps,
-                           EncoderBackend::Nvenc))
+                           EncoderBackend::Nvenc, cuda_device))
     return true;
 
   log_msg(LOG_WARNING, "encoder",
           "falling back to libx264 software encoder");
   if (open_encoder_backend(e, width, height, pix_fmt, fps,
-                           EncoderBackend::X264))
+                           EncoderBackend::X264, nullptr))
     return true;
 
   log_msg(LOG_ERROR, "encoder", "all H.264 encoder backends failed");
@@ -216,14 +251,21 @@ bool serve_stream(Encoder &e, Server &s, AVFrame *frame) {
 
   frame->pts = e.next_pts++;
 
-  int ret = avcodec_send_frame(e.codec_ctx, frame);
+  int ret;
+  {
+    ProfileRange range(Stage::Encode, "send frame");
+    ret = avcodec_send_frame(e.codec_ctx, frame);
+  }
   if (ret < 0) {
     log_av_error(LOG_ERROR, "encoder", "sending frame to encoder failed", ret);
     return false;
   }
 
   while (true) {
-    ret = avcodec_receive_packet(e.codec_ctx, e.packet);
+    {
+      ProfileRange range(Stage::Encode, "receive packet");
+      ret = avcodec_receive_packet(e.codec_ctx, e.packet);
+    }
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
       return true;
     if (ret < 0) {
@@ -232,6 +274,7 @@ bool serve_stream(Encoder &e, Server &s, AVFrame *frame) {
       return false;
     }
 
+    ProfileRange range(Stage::Encode, "mux");
     if (!write_packet(s, e.packet, e.codec_ctx->time_base))
       return false;
   }
