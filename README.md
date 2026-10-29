@@ -40,15 +40,18 @@ Thirty-two streams:
   <img src="docs/assets/argus_32_streams_yolo11s_demo.gif" alt="argus YOLO11s 32 stream demo" width="100%">
 </p>
 
-The demos use public HLS traffic cameras processed with YOLO11s. Argus decodes
-the inputs, runs TensorRT inference, draws detections, and writes processed HLS
-outputs.
+The demos use clips from Transport for London's public JamCam traffic cameras
+(352x288, 25 FPS, about 10 seconds each), processed with the fp16 uint8
+YOLO11s engine. Argus decodes the inputs, runs TensorRT inference, draws
+detections, and writes one processed MPEG-TS output per stream. In the
+32-stream run every frame of every input came out the other end; 12 streams
+encoded on NVENC and the other 20 fell back to libx264.
 
 The one-stream and two-stream demos were captured as separate runs with only
 those inputs active.
 
 All demos were captured on an NVIDIA GeForce RTX 3070 Laptop GPU with 8 GB of
-VRAM.
+VRAM, using TensorRT 11.
 
 ## Features
 
