@@ -4,6 +4,7 @@
 #include "server.hxx"
 #include "streams.hxx"
 
+#include <algorithm>
 #include <string>
 
 extern "C" {
@@ -100,7 +101,8 @@ void set_backend_options(AVDictionary **opts, EncoderBackend backend) {
 
 bool open_encoder_backend(Encoder &e, int width, int height,
                           AVPixelFormat pix_fmt, AVRational fps,
-                          EncoderBackend backend, AVBufferRef *cuda_device) {
+                          AVRational time_base, EncoderBackend backend,
+                          AVBufferRef *cuda_device) {
   const char *codec_name = backend_codec_name(backend);
   log_msg(LOG_INFO, "encoder",
           std::string("finding H.264 encoder ") + codec_name);
@@ -138,7 +140,10 @@ bool open_encoder_backend(Encoder &e, int width, int height,
   e.codec_ctx->width = width;
   e.codec_ctx->height = height;
   e.codec_ctx->pix_fmt = pix_fmt;
-  e.codec_ctx->time_base = av_inv_q(fps);
+  // Encode on the source's clock so frames keep their real spacing.
+  e.codec_ctx->time_base = time_base;
+  e.frame_duration =
+      std::max<int64_t>(1, av_rescale_q(1, av_inv_q(fps), time_base));
   e.codec_ctx->framerate = fps;
   e.codec_ctx->bit_rate = 4000000;
   e.codec_ctx->gop_size = fps_rounded;
@@ -226,18 +231,20 @@ bool open_encoder(Encoder &e, AVStream *in_stream,
 
   return open_encoder(e, decoder_codec_ctx->width, decoder_codec_ctx->height,
                       (AVPixelFormat)decoder_codec_ctx->pix_fmt,
-                      stream_fps(in_stream), cuda_device);
+                      stream_fps(in_stream), in_stream->time_base,
+                      cuda_device);
 }
 
 bool open_encoder(Encoder &e, int width, int height, AVPixelFormat pix_fmt,
-                  AVRational fps, AVBufferRef *cuda_device) {
-  if (open_encoder_backend(e, width, height, pix_fmt, fps,
+                  AVRational fps, AVRational time_base,
+                  AVBufferRef *cuda_device) {
+  if (open_encoder_backend(e, width, height, pix_fmt, fps, time_base,
                            EncoderBackend::Nvenc, cuda_device))
     return true;
 
   log_msg(LOG_WARNING, "encoder",
           "falling back to libx264 software encoder");
-  if (open_encoder_backend(e, width, height, pix_fmt, fps,
+  if (open_encoder_backend(e, width, height, pix_fmt, fps, time_base,
                            EncoderBackend::X264, nullptr))
     return true;
 
@@ -249,7 +256,28 @@ bool serve_stream(Encoder &e, Server &s, AVFrame *frame) {
   if (!e.codec_ctx || !e.packet || !frame)
     return false;
 
-  frame->pts = e.next_pts++;
+  // Use the source timestamps, not a frame counter at the declared rate: a
+  // camera that declares 30 fps but sends 15 would otherwise play back at
+  // double speed. Gaps (skipped live segments) stay gaps.
+  int64_t ts = frame->best_effort_timestamp;
+  if (ts == AV_NOPTS_VALUE)
+    ts = frame->pts;
+  int64_t pts;
+  if (ts == AV_NOPTS_VALUE) {
+    pts = e.last_pts == AV_NOPTS_VALUE ? 0 : e.last_pts + e.frame_duration;
+  } else {
+    if (e.first_ts == AV_NOPTS_VALUE)
+      e.first_ts = ts;
+    pts = ts - e.first_ts;
+    // A live stream can jump back (playlist discontinuity or a timestamp
+    // reset); carry on one frame after the last one instead.
+    if (e.last_pts != AV_NOPTS_VALUE && pts <= e.last_pts) {
+      e.first_ts += pts - (e.last_pts + e.frame_duration);
+      pts = e.last_pts + e.frame_duration;
+    }
+  }
+  e.last_pts = pts;
+  frame->pts = pts;
 
   int ret;
   {
@@ -310,5 +338,7 @@ void close_encoder(Encoder &e) {
     av_packet_free(&e.packet);
   if (e.codec_ctx)
     avcodec_free_context(&e.codec_ctx);
-  e.next_pts = 0;
+  e.first_ts = AV_NOPTS_VALUE;
+  e.last_pts = AV_NOPTS_VALUE;
+  e.frame_duration = 1;
 }

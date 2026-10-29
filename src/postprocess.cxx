@@ -212,6 +212,7 @@ void draw_box(const std::vector<Detection> &dets, AVFrame *frame) {
 
   int width = frame->width;
   int height = frame->height;
+  int thickness = std::max(2, height / 144);
   for (const auto &d : dets) {
     int ix1 = std::clamp((int)d.x1, 0, width - 1);
     int iy1 = std::clamp((int)d.y1, 0, height - 1);
@@ -220,11 +221,17 @@ void draw_box(const std::vector<Detection> &dets, AVFrame *frame) {
     if (ix2 <= ix1 || iy2 <= iy1)
       continue;
 
+    // Scale with the frame so boxes stay visible when the video is shown
+    // smaller, but never thicker than half the box.
+    int box_thickness =
+        std::min({thickness, (ix2 - ix1 + 1) / 2, (iy2 - iy1 + 1) / 2});
+    box_thickness = std::max(1, box_thickness);
     const YuvColor &color = colorForClass(d.classId);
     if (frame->format == AV_PIX_FMT_NV12)
-      drawBox(frame, ix1, iy1, ix2, iy2, color, setNv12Pixel);
+      drawBox(frame, ix1, iy1, ix2, iy2, color, setNv12Pixel, box_thickness);
     else if (frame->format == AV_PIX_FMT_YUV420P ||
              frame->format == AV_PIX_FMT_YUVJ420P)
-      drawBox(frame, ix1, iy1, ix2, iy2, color, setYuv420pPixel);
+      drawBox(frame, ix1, iy1, ix2, iy2, color, setYuv420pPixel,
+              box_thickness);
   }
 }

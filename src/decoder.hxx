@@ -28,6 +28,7 @@ struct StreamFrame {
   int stream_index = -1;
   int64_t frame_id = 0;
   AVRational frame_rate = {30, 1};
+  AVRational time_base = {1, 90000};
   LetterboxTransform letterbox;
   InputFrame frame_rgb;
   std::unique_ptr<float[]> output;
@@ -35,9 +36,10 @@ struct StreamFrame {
 
   StreamFrame() = default;
   StreamFrame(AVFrame *frame, int stream_index, int64_t frame_id,
-              AVRational frame_rate = {30, 1})
+              AVRational frame_rate = {30, 1},
+              AVRational time_base = {1, 90000})
       : frame(frame), stream_index(stream_index), frame_id(frame_id),
-        frame_rate(frame_rate) {}
+        frame_rate(frame_rate), time_base(time_base) {}
 
   ~StreamFrame() {
     if (frame)
@@ -65,6 +67,7 @@ private:
     stream_index = other.stream_index;
     frame_id = other.frame_id;
     frame_rate = other.frame_rate;
+    time_base = other.time_base;
     letterbox = other.letterbox;
     frame_rgb = std::move(other.frame_rgb);
     output = std::move(other.output);
