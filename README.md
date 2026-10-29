@@ -34,21 +34,30 @@ Two streams:
   <img src="docs/assets/argus_2_streams_yolo11s_demo.gif" alt="argus YOLO11s two stream demo" width="100%">
 </p>
 
-Thirty-two streams:
+Thirty-six live streams:
 
 <p align="center">
-  <img src="docs/assets/argus_32_streams_yolo11s_demo.gif" alt="argus YOLO11s 32 stream demo" width="100%">
+  <img src="docs/assets/argus_36_live_streams_demo.gif" alt="argus YOLO11s 36 live stream demo" width="100%">
 </p>
 
-The demos use clips from Transport for London's public JamCam traffic cameras
-(352x288, 25 FPS, about 10 seconds each), processed with the fp16 uint8
-YOLO11s engine. Argus decodes the inputs, runs TensorRT inference, draws
-detections, and writes one processed MPEG-TS output per stream. In the
-32-stream run every frame of every input came out the other end; 12 streams
-encoded on NVENC and the other 20 fell back to libx264.
+The full 45-second recording is in
+[docs/assets/argus_36_live_streams_demo.mp4](docs/assets/argus_36_live_streams_demo.mp4).
 
-The one-stream and two-stream demos were captured as separate runs with only
-those inputs active.
+The 36-stream demo is live: public HLS traffic cameras from the Nevada,
+Louisiana, Wisconsin and Iowa DOTs (Las Vegas, New Orleans, Milwaukee and Des
+Moines), 270p to 720p at 10 to 30 FPS, recorded on a weekday morning. Argus
+kept up with every stream for the whole run. Its output timestamps come from
+the cameras, and the only skipped HLS segment was one during startup. 12
+streams encoded on NVENC and the rest fell back to libx264.
+
+The one-stream and two-stream demos use clips from Transport for London's
+public JamCam traffic cameras (352x288, 25 FPS, about 10 seconds each), each
+captured as a separate run with only those inputs active. Every frame of every
+input came out the other end.
+
+All demos use the fp16 uint8 YOLO11s engine. Argus decodes the inputs, runs
+TensorRT inference, draws detections, and writes one processed MPEG-TS output
+per stream.
 
 All demos were captured on an NVIDIA GeForce RTX 3070 Laptop GPU with 8 GB of
 VRAM, using TensorRT 11.
@@ -57,11 +66,13 @@ VRAM, using TensorRT 11.
 
 - **Stream Input**: Opens video inputs through FFmpeg/libav, including RTSP, HLS, HTTP media, and local files. Pass `--input` once per stream
 - **NVIDIA Decode Path**: Prefers CUVID decoders such as `h264_cuvid` when the input codec supports them
+- **Live Inputs**: Opens up to 8 inputs at a time and starts decoding each one as soon as it connects. Every network input gets its own decode thread, so one slow download doesn't hold up the other streams
+- **Source Timing**: Output frames keep the input's timestamps, so a camera that sends fewer frames than it declares still plays back at the right speed
 - **Inference Backends**: TensorRT (NVIDIA), MIGraphX (AMD, untested on hardware) and OpenVINO (x86 CPUs, Intel GPUs), picked with `--device`
 - **Batched Inference**: Frames from all streams are batched together. On CUDA two engine slots run at once, so one batch uploads while the other computes
 - **Frame Preprocessing**: Letterboxes decoded frames straight into pinned input buffers, as float CHW or uint8 RGB depending on the model
 - **Postprocessing**: Converts model output into detection boxes in source-frame coordinates, with NMS in the model or on the CPU
-- **Bounding Box Overlay**: Draws detections directly onto the local decoded video frame
+- **Bounding Box Overlay**: Draws detections directly onto the local decoded video frame, with line thickness scaled to the frame height
 - **H.264 Encoding**: Prefers `h264_nvenc` and falls back to `libx264`
 - **Stream Output**: Writes encoded packets to RTSP, HLS, MP4, MPEG-TS, or Matroska outputs through FFmpeg/libav
 - **Profiling**: NVTX labels on every stage for Nsight Systems
@@ -212,6 +223,12 @@ inference   2 threads
 The percentage math uses integer division, so unused remainder threads are not
 assigned yet.
 
+Network inputs are the exception for decode. Reading a live stream blocks until
+the next segment arrives, and a thread waiting on a socket uses no CPU, so
+decode gets at least one thread per network input. With 36 live cameras that
+is 36 decode threads. With 2 threads, each stream got only about 7 seconds of
+video per 50 seconds of wall time.
+
 ### Stage Details
 
 Decode scheduling:
@@ -219,15 +236,13 @@ Decode scheduling:
 ```mermaid
 flowchart LR
     urls[Input URLs] --> states[DecodeState per stream]
-    urls --> work_q[Decode work queue: stream index]
+    states --> openers[Open workers: up to 8 at a time]
+    openers -- opened --> work_q[Decode work queue: stream index]
+    openers -- failed --> active_count
     work_q --> worker[Decoder worker]
-    states --> worker
-    worker --> opened{Stream opened?}
-    opened -- no --> open_stream[openStream and read frame rate]
-    opened -- yes --> next_frame[nextFrame]
-    open_stream --> next_frame
+    worker --> next_frame[nextFrame]
     next_frame -- decoded frame --> clone[av_frame_clone]
-    clone --> stream_frame[StreamFrame: frame, stream index, frame id, fps]
+    clone --> stream_frame[StreamFrame: frame, stream index, frame id, fps, time base]
     stream_frame --> decoded_q[Decoded frame queue]
     stream_frame --> requeue[Requeue stream index]
     requeue --> work_q

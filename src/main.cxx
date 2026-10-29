@@ -53,6 +53,7 @@ struct DecodeState {
   int stream_index = -1;
   int64_t frame_count = 0;
   AVRational frame_rate = {30, 1};
+  AVRational time_base = {1, 90000};
   bool opened = false;
 };
 
@@ -135,26 +136,32 @@ AVRational decoder_frame_rate(Decoder &decoder) {
   return AVRational{30, 1};
 }
 
-bool decode_one_frame(const AppConfig &config, DecodeState &state,
+bool open_decode_stream(const AppConfig &config, DecodeState &state) {
+  const std::string &input_url = config.input_urls[state.stream_index];
+  log_msg(LOG_INFO, "decoder",
+          "stream " + std::to_string(state.stream_index) +
+              " input: " + input_url);
+
+  ProfileRange range(Stage::Decode, "open stream");
+  if (!openStream(state.decoder, input_url.c_str())) {
+    closeStream(state.decoder);
+    return false;
+  }
+
+  state.frame_rate = decoder_frame_rate(state.decoder);
+  state.time_base =
+      state.decoder.formatCtx->streams[state.decoder.videoStreamIndex]
+          ->time_base;
+  state.opened = true;
+  return true;
+}
+
+bool decode_one_frame(DecodeState &state,
                       ThreadQueue<StreamFrame> &decoder_queue,
                       std::atomic<bool> &pipeline_ok) {
   int stream_index = state.stream_index;
-
-  if (!state.opened) {
-    const std::string &input_url = config.input_urls[stream_index];
-    log_msg(LOG_INFO, "decoder",
-            "stream " + std::to_string(stream_index) + " input: " + input_url);
-
-    ProfileRange range(Stage::Decode, "open stream");
-    if (!openStream(state.decoder, input_url.c_str())) {
-      pipeline_ok = false;
-      closeStream(state.decoder);
-      return false;
-    }
-
-    state.frame_rate = decoder_frame_rate(state.decoder);
-    state.opened = true;
-  }
+  if (!state.opened)
+    return false;
 
   int64_t frame_id = state.frame_count;
   AVFrame *frame = nullptr;
@@ -186,7 +193,8 @@ bool decode_one_frame(const AppConfig &config, DecodeState &state,
   }
 
   if (!decoder_queue.push(
-          StreamFrame{frame, stream_index, frame_id, state.frame_rate})) {
+          StreamFrame{frame, stream_index, frame_id, state.frame_rate,
+                      state.time_base})) {
     av_frame_free(&frame);
     return false;
   }
@@ -194,7 +202,7 @@ bool decode_one_frame(const AppConfig &config, DecodeState &state,
   return true;
 }
 
-void run_decode(const AppConfig &config, ThreadQueue<int> &decode_work_queue,
+void run_decode(ThreadQueue<int> &decode_work_queue,
                 std::vector<std::unique_ptr<DecodeState>> &decode_states,
                 ThreadQueue<StreamFrame> &decoder_queue,
                 std::atomic<int> &active_decode_streams,
@@ -209,8 +217,7 @@ void run_decode(const AppConfig &config, ThreadQueue<int> &decode_work_queue,
     }
 
     DecodeState &state = *decode_states[stream_index];
-    bool keep_active =
-        decode_one_frame(config, state, decoder_queue, pipeline_ok);
+    bool keep_active = decode_one_frame(state, decoder_queue, pipeline_ok);
     if (keep_active) {
       decode_work_queue.push(stream_index);
       continue;
@@ -375,7 +382,7 @@ bool encode_output_frame(OutputState &state, const AppConfig &config,
         indexed_output_url(config.output_url, item.stream_index);
     if (!open_encoder(state.encoder, item.frame->width, item.frame->height,
                       (AVPixelFormat)item.frame->format, item.frame_rate,
-                      state.cuda_device)) {
+                      item.time_base, state.cuda_device)) {
       state.output_failed = true;
       pipeline_ok = false;
       return false;
@@ -518,14 +525,36 @@ bool run_stream(Engine &engine, const AppConfig &config, int batch_size) {
     auto state = std::make_unique<DecodeState>();
     state->stream_index = stream_index;
     decode_states.push_back(std::move(state));
-    decode_work_queue.push(stream_index);
   }
 
   for (int i = 0; i < config.decoder_threads_count; i++) {
     decoder_threads.emplace_back(
-        run_decode, std::ref(config), std::ref(decode_work_queue),
+        run_decode, std::ref(decode_work_queue),
         std::ref(decode_states), std::ref(decoder_queue),
         std::ref(active_decode_streams), std::ref(pipeline_ok), i);
+  }
+
+  // Opening a network input can take seconds, so open several at once and
+  // hand each stream to the decode threads as soon as it is open. Waiting
+  // for all of them would leave live streams idle and falling behind. Capped,
+  // because some servers refuse a burst of connections from one address.
+  // A stream still being opened counts as active, so the work queue can't
+  // close before every open has finished.
+  constexpr int kMaxParallelOpens = 8;
+  std::atomic<int> next_open{0};
+  std::vector<std::thread> open_threads;
+  for (int i = 0; i < std::min(stream_count, kMaxParallelOpens); i++) {
+    open_threads.emplace_back([&] {
+      for (int s = next_open++; s < stream_count; s = next_open++) {
+        if (open_decode_stream(config, *decode_states[s])) {
+          decode_work_queue.push(s);
+          continue;
+        }
+        pipeline_ok = false;
+        if (--active_decode_streams == 0)
+          decode_work_queue.close();
+      }
+    });
   }
 
   for (int i = 0; i < config.preprocessor_threads_count; i++) {
@@ -573,6 +602,8 @@ bool run_stream(Engine &engine, const AppConfig &config, int batch_size) {
                                 i);
   }
 
+  for (auto &thread : open_threads)
+    thread.join();
   for (auto &thread : decoder_threads)
     thread.join();
   decoder_queue.close();
@@ -662,6 +693,18 @@ int main(int argc, char **argv) {
       std::max(config.drawer_threads_count, max_threads * 1 / 10);
   config.encoder_threads_count =
       std::max(config.encoder_threads_count, max_threads * 3 / 10);
+
+  // Reading a live network stream blocks until the next segment arrives, and
+  // a thread waiting on a socket uses no CPU. Give each network input its own
+  // decode thread so a slow download doesn't hold up the other streams.
+  int network_inputs = (int)std::count_if(
+      config.input_urls.begin(), config.input_urls.end(),
+      [](const std::string &url) {
+        return url.find("://") != std::string::npos &&
+               url.rfind("file:", 0) != 0;
+      });
+  config.decoder_threads_count =
+      std::max(config.decoder_threads_count, network_inputs);
 
   bool stream_ok = run_stream(*engine, config, batch_size);
   return stream_ok ? 0 : -1;

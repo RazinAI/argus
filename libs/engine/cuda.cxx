@@ -264,6 +264,17 @@ std::unique_ptr<Engine> load_engine(const char *engine_path, int batch_size) {
             std::string("could not set blocking sync: ") +
                 cudaGetErrorString(flags_err));
 
+  // TensorRT still hands back a runtime when CUDA can't start (for example
+  // when another process holds all GPU memory) and then crashes in
+  // deserialize, so create the context here and stop if that fails.
+  cudaError_t init_err = cudaFree(nullptr);
+  if (init_err != cudaSuccess) {
+    log_msg(LOG_CRITICAL, "engine",
+            std::string("could not initialize CUDA: ") +
+                cudaGetErrorString(init_err));
+    return nullptr;
+  }
+
   auto owner = std::make_unique<CudaEngine>();
   CudaEngine &e = *owner;
   e.maxBatchSize = batch_size;
